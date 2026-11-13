@@ -7,9 +7,11 @@ import torch
 from vllm.config import LoadConfig, replace
 from vllm.distributed import get_pp_group
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.worker.gpu.async_utils import async_copy_to_np
 from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 
 logger = init_logger(__name__)
 
@@ -93,6 +95,174 @@ class DraftTokensHandler:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
         return DraftTokenIds(self.req_ids, draft_token_ids)
+
+
+@triton.jit
+def _selector_walk_kernel(
+    scores_ptr,
+    candidate_ptr,
+    sample_pos_ptr,
+    req_state_ptr,
+    temperature_ptr,
+    seeds_ptr,
+    tokens_ptr,
+    realized_scores_ptr,
+    num_steps: tl.constexpr,
+    top_k: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SAMPLE_PROBABILISTIC: tl.constexpr,
+    USE_FP64: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_K)
+    mask = offsets < top_k
+    req_state = tl.load(req_state_ptr + row * num_steps)
+    valid = req_state >= 0
+    temperature = tl.load(temperature_ptr + req_state, mask=valid, other=0.0)
+    seed = tl.load(seeds_ptr + req_state, mask=valid, other=0)
+    previous = 0
+    for step in range(num_steps):
+        flat = row * num_steps + step
+        score_base = (flat * top_k + previous) * top_k
+        scores = tl.load(
+            scores_ptr + score_base + offsets,
+            mask=mask & valid,
+            other=float("-inf"),
+        ).to(tl.float64 if USE_FP64 else tl.float32)
+        candidate_base = flat * top_k
+        candidates = tl.load(
+            candidate_ptr + candidate_base + offsets,
+            mask=mask & valid,
+            other=0,
+        )
+
+        # sample_pos is the predicted token's position P. Sampling keys a draw
+        # by the position before the sampled token, P-1.
+        sample_pos = tl.load(sample_pos_ptr + flat) - 1
+        _, index = gumbel_noised_argmax(
+            scores,
+            candidates,
+            mask & valid,
+            seed,
+            sample_pos,
+            temperature if SAMPLE_PROBABILISTIC else 0.0,
+            IS_DRAFTING=True,
+            USE_FP64=USE_FP64,
+        )
+
+        tl.store(
+            realized_scores_ptr + candidate_base + offsets,
+            scores,
+            mask=mask & valid,
+        )
+        token = tl.load(candidate_ptr + candidate_base + index, mask=valid, other=0)
+        tl.store(tokens_ptr + flat, token, mask=valid)
+        previous = index
+
+
+@triton.jit
+def _cache_draft_logits_kernel(
+    draft_logits_ptr,
+    cached_candidate_ptr,
+    candidate_ptr,
+    scores_ptr,
+    req_state_ptr,
+    draft_logits_stride_0,
+    draft_logits_stride_1,
+    num_steps: tl.constexpr,
+    top_k: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    flat = tl.program_id(0)
+    req_state = tl.load(req_state_ptr + flat)
+    step = flat % num_steps
+    offsets = tl.arange(0, BLOCK_K)
+    mask = (req_state >= 0) & (offsets < top_k)
+    candidate_base = flat * top_k
+    cache_base = (req_state * num_steps + step) * top_k
+    old_token_ids = tl.load(cached_candidate_ptr + cache_base + offsets, mask=mask)
+    logits_base = (
+        draft_logits_ptr
+        + req_state * draft_logits_stride_0
+        + step * draft_logits_stride_1
+    )
+    tl.store(logits_base + old_token_ids, -float("inf"), mask=mask)
+    token_ids = tl.load(candidate_ptr + candidate_base + offsets, mask=mask)
+    scores = tl.load(scores_ptr + candidate_base + offsets, mask=mask)
+    tl.store(logits_base + token_ids, scores, mask=mask)
+    tl.store(cached_candidate_ptr + cache_base + offsets, token_ids, mask=mask)
+
+
+def walk_candidate_scores(
+    scores: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    *,
+    top_k: int,
+    num_steps: int,
+    num_reqs: int,
+    sample_pos: torch.Tensor,
+    sample_idx_mapping: torch.Tensor,
+    temperature: torch.Tensor,
+    seeds: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    realized_scores: torch.Tensor,
+    sample_probabilistic: bool,
+    use_fp64: bool,
+) -> None:
+    """Walk every request's serial chain through a [rows, top_k, top_k] table.
+
+    Shared by the candidate-table drafters (DFlash2, DSpine). scores[n, j, c]
+    scores candidate c of row n when the previous row chose lane j; the lane
+    picked at row n selects the sender of row n + 1. The realized score row of
+    each step is kept in realized_scores for the proposal logits.
+    """
+    _selector_walk_kernel[(num_reqs,)](
+        scores.contiguous(),
+        candidate_ids.contiguous(),
+        sample_pos,
+        sample_idx_mapping,
+        temperature,
+        seeds,
+        draft_tokens,
+        realized_scores,
+        num_steps=num_steps,
+        top_k=top_k,
+        BLOCK_K=triton.next_power_of_2(top_k),
+        SAMPLE_PROBABILISTIC=sample_probabilistic,
+        USE_FP64=use_fp64,
+        num_warps=1,
+    )
+
+
+def cache_candidate_logits(
+    draft_logits: torch.Tensor,
+    cached_candidate_ids: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    realized_scores: torch.Tensor,
+    *,
+    top_k: int,
+    num_steps: int,
+    sample_idx_mapping: torch.Tensor,
+    num_sample: int,
+) -> None:
+    """Write the walked candidates and their scores into the proposal logits.
+
+    Shared by the candidate-table drafters. Each row only carries top_k scores,
+    so the candidates cached from the previous step are cleared first.
+    """
+    _cache_draft_logits_kernel[(num_sample,)](
+        draft_logits,
+        cached_candidate_ids,
+        candidate_ids,
+        realized_scores,
+        sample_idx_mapping,
+        draft_logits.stride(0),
+        draft_logits.stride(1),
+        num_steps=num_steps,
+        top_k=top_k,
+        BLOCK_K=triton.next_power_of_2(top_k),
+        num_warps=1,
+    )
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:

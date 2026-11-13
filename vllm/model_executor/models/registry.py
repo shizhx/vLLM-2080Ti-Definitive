@@ -635,6 +635,10 @@ _SPECULATIVE_DECODING_MODELS = {
     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
     "DFlash2DraftModel": ("qwen3_dflash2", "DFlash2Qwen3ForCausalLM"),
+    # DSpine is a DFlash draft with a code bridge. Its checkpoint declares the
+    # plain DFlashDraftModel architecture, so vllm/config/speculative.py rewrites
+    # it to this name when the config names a code bridge.
+    "DSpineDraftModel": ("qwen3_dspine", "DSpineQwen3ForCausalLM"),
     # Muse Glimmer's DFlash draft head, reusing the generic qwen3_dflash
     # implementation. EAGLEConfig rewrites a dflash draft's architecture to
     # DFlash{arch} unless it already starts or ends with "DFlash" (see

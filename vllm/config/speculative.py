@@ -132,6 +132,17 @@ def _get_nested_config_value(config: Any, section: str, name: str) -> Any:
     return getattr(nested_config, name, None)
 
 
+def _is_dspine_draft_config(config: Any) -> bool:
+    """Whether a draft config carries a DSpine code bridge.
+
+    A DSpine checkpoint declares the plain DFlashDraftModel architecture, so the
+    bridge is the only reliable identity (docs/design/dspine-vllm-port.md §7.1).
+    """
+    from vllm.model_executor.models.dspine_contract import is_dspine_draft
+
+    return is_dspine_draft(config)
+
+
 def _get_qwen3_dspark_value(config: Any, name: str) -> Any:
     # Match DFlashQwen3Model's precedence: dflash_config overrides
     # eagle_config, and top-level values are the modern fallback.
@@ -1333,6 +1344,16 @@ class SpeculativeConfig:
                     )
                 ):
                     self.method = "dspark"
+                elif (
+                    "dspine" in self.draft_model_config.model.lower()
+                    or _is_dspine_draft_config(self.draft_model_config.hf_config)
+                ):
+                    # DSpine is a DFlash draft plus a code bridge. It keeps the
+                    # "dflash" method so it inherits every DFlash invariant
+                    # (extra drafting slots, capture sizing, prefix-cache
+                    # masking, hybrid-state restore) instead of silently missing
+                    # them under a new method string.
+                    self.method = "dflash"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -1399,6 +1420,9 @@ class SpeculativeConfig:
                         )
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
+
+                if self.method == "dflash":
+                    self._configure_dspine_draft()
 
                 if (
                     self.method == "dspark"
@@ -1715,6 +1739,37 @@ class SpeculativeConfig:
                 f"other value than 1 or target model tensor_parallel_size"
             )
         return speculative_draft_tensor_parallel_size
+
+    def _configure_dspine_draft(self) -> None:
+        """Check a DSpine draft's contract and route it to its own implementation.
+
+        Runs after the EAGLEConfig wrap: that wrap prefixes any architecture that
+        neither starts nor ends with "DFlash", which would turn
+        ``DSpineDraftModel`` into ``DFlashDSpineDraftModel``.
+        """
+        from vllm.model_executor.models.dspine_contract import (
+            DSPINE_DRAFT_ARCHITECTURE,
+            resolve_dspine_contract,
+        )
+
+        hf_config = self.draft_model_config.hf_config
+        if not _is_dspine_draft_config(hf_config):
+            return
+        # Raises with the reason when the checkpoint promises a bridge feature
+        # this host does not implement.
+        contract = resolve_dspine_contract(hf_config)
+        if DSPINE_DRAFT_ARCHITECTURE not in self.draft_model_config.architectures:
+            hf_config.architectures = [DSPINE_DRAFT_ARCHITECTURE]
+            self.update_arch_()
+        logger.info(
+            "DSpine draft: code_size=%d rank=%d head_topk=%d trained_block=%d "
+            "(served as method=dflash, %d speculative tokens)",
+            contract.code_size,
+            contract.rank,
+            contract.head_topk,
+            contract.trained_block_size,
+            self.num_speculative_tokens,
+        )
 
     def update_arch_(self):
         """

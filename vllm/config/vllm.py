@@ -733,6 +733,18 @@ class VllmConfig:
             return False
         return "DFlash2DraftModel" in (draft_config.architectures or [])
 
+    def _is_dspine_draft(self) -> bool:
+        """Whether the DFlash draft carries a DSpine code bridge, by the
+        architecture the speculator selects on (vllm/config/speculative.py
+        rewrites it from the bridge the checkpoint declares)."""
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash":
+            return False
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        return "DSpineDraftModel" in (draft_config.architectures or [])
+
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
         spec = self.speculative_config
@@ -2907,6 +2919,13 @@ class VllmConfig:
         # calls it, so the draft would degrade to DFlash1 silently.
         if self._is_dflash2_draft():
             unsupported.append("dflash2 drafts")
+
+        # The DSpine code bridge and its refinement tail live in the V2
+        # speculator too. On V1 the same checkpoint would draft through the
+        # plain DFlash proposer, without the bridge, and quietly lose the
+        # acceptance length the checkpoint was trained for.
+        if self._is_dspine_draft():
+            unsupported.append("dspine drafts")
 
         if self.model_config is not None and self.model_config.is_diffusion:
             unsupported.append("diffusion models")
