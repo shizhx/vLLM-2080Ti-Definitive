@@ -94,20 +94,23 @@ def code_bridge_write(
     mlp_out: [rows, hidden] this layer's attention-plus-MLP output.
     residual: [rows, hidden] incoming residual stream, or None when the layer
         contributed the whole stream.
-    anchor_codes: [blocks, code_size] codebook rows of every block's anchor
-        (bonus) token, unscaled. Anchor rows keep the exact token code instead
-        of a code predicted from features, and never send a message.
+    anchor_codes: [rows, code_size] codebook row of the anchor (bonus) token of
+        the block each row belongs to, repeated over that block. Anchor rows keep
+        the exact token code instead of a code predicted from features, and never
+        send a message.
 
-    The rows must be laid out as whole request blocks: ``rows`` is
-    ``blocks * block_size`` and row 0 of every block is its anchor.
+    The rows are whole request blocks: row 0 of every block is its anchor. Only
+    the block size locates those rows, and only on tensor *values*. The row count
+    stays symbolic because this runs inside the draft model's compiled forward,
+    where solving a marked-dynamic shape into a constant is an error, not a
+    recompile. The eager `refine_last_write` takes the same rows and checks them.
     """
-    num_rows, hidden = mlp_out.shape
-    if num_rows % block_size:
-        raise ValueError(
-            f"A code-bridge write needs whole request blocks, got {num_rows} rows "
-            f"for a block size of {block_size}."
-        )
-    blocks = num_rows // block_size
+    num_rows = mlp_out.shape[0]
+    row = torch.arange(num_rows, device=mlp_out.device)
+    # Row 0 of a block is its anchor; every other row reads its predecessor. The
+    # clamp only keeps the gather in range: anchor messages are masked away below.
+    anchor_row = row - row % block_size
+    is_anchor = anchor_row == row
     rank = write_weight.shape[1]
     dtype = mlp_out.dtype
     code_scale = code_size**0.5
@@ -123,28 +126,18 @@ def code_bridge_write(
     projected = F.linear(normalized, read_weight).float()
 
     # --- Codes: unit-direction prediction rows, exact token codes on anchors ---
-    predicted = projected.view(blocks, block_size, code_size)[:, 1:]
-    codes = torch.cat(
-        (
-            anchor_codes.float().unsqueeze(1) * code_scale,
-            code_scale * predicted
-            / (predicted.norm(dim=-1, keepdim=True) + eps),
-        ),
-        dim=1,
-    ).view(num_rows, code_size)
-    codes = codes.to(dtype)
+    predicted = code_scale * projected / (projected.norm(dim=-1, keepdim=True) + eps)
+    codes = torch.where(
+        is_anchor[:, None], anchor_codes.float() * code_scale, predicted
+    ).to(dtype)
 
     # --- Message: the predecessor's gated value, none on an anchor row ---
     packed = F.linear(codes, packed_weight)
-    packed_blocks = packed.view(blocks, block_size, 3 * rank)
-    query = packed_blocks[:, 1:, :rank]
-    sender = packed_blocks[:, :-1, rank : 2 * rank]
-    value = packed_blocks[:, :-1, 2 * rank :]
-    message_body = torch.sigmoid(query.float() + sender.float() + gate_bias.float())
-    message_body = (message_body * value.float()).to(dtype)
-    message = torch.cat(
-        (message_body.new_zeros(blocks, 1, rank), message_body), dim=1
-    ).view(num_rows, rank)
+    query = packed[:, :rank]
+    sender = packed[(row - 1).clamp_min(0), rank : 2 * rank]
+    value = packed[(row - 1).clamp_min(0), 2 * rank :]
+    message = torch.sigmoid(query.float() + sender.float() + gate_bias.float())
+    message = torch.where(is_anchor[:, None], 0, message * value.float()).to(dtype)
 
     # --- Write: scale the message into the residual stream, then normalize ---
     delta = F.linear(message, write_weight)

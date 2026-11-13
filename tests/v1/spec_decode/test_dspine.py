@@ -14,11 +14,10 @@ c66bf44) for the upstream originals of `ref_eager_bridge_write` and
 import math
 from types import SimpleNamespace
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._dynamo.utils import counters
 from transformers import Qwen3Config
 
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
@@ -80,6 +79,18 @@ def make_bridge_case(
         eps=1e-6,
         norm_eps=1e-6,
         dtype=dtype,
+    )
+
+
+def row_anchor_codes(case: dict) -> torch.Tensor:
+    """Codebook row of each row's block anchor, repeated over that block.
+
+    `code_bridge_write` takes the anchor of the block a row belongs to on every
+    row, because the write finds the anchor rows itself and must not divide the
+    row count to do it.
+    """
+    return case["codebook"][case["anchor_ids"]].repeat_interleave(
+        case["block_size"], dim=0
     )
 
 
@@ -223,7 +234,7 @@ def test_code_bridge_write_matches_float64_reference(block_size: int):
     actual = code_bridge_write(
         case["mlp_out"],
         case["residual"],
-        case["codebook"][case["anchor_ids"]],
+        row_anchor_codes(case),
         read_weight=case["read_weight"],
         packed_weight=torch.cat(
             (case["gate_weight"], case["predecessor_gate_weight"], case["prev_weight"]),
@@ -263,7 +274,7 @@ def test_code_bridge_write_matches_the_upstream_eager_path(block_size: int, dtyp
     actual = code_bridge_write(
         case["mlp_out"],
         case["residual"],
-        case["codebook"][case["anchor_ids"]],
+        row_anchor_codes(case),
         read_weight=case["read_weight"],
         packed_weight=torch.cat(
             (case["gate_weight"], case["predecessor_gate_weight"], case["prev_weight"]),
@@ -292,7 +303,7 @@ def test_code_bridge_anchor_rows_keep_their_own_stream(block_size: int):
     already accepted) free of any draft-side prediction error.
     """
     case = cast_bridge_case(make_bridge_case(3, block_size))
-    anchor_codes = case["codebook"][case["anchor_ids"]]
+    anchor_codes = row_anchor_codes(case)
     write = lambda codes: code_bridge_write(  # noqa: E731
         case["mlp_out"],
         case["residual"],
@@ -349,7 +360,7 @@ def test_code_bridge_write_stays_inside_its_block(block_size: int, offset: int):
         eps=case["eps"],
         norm_eps=case["norm_eps"],
     )
-    anchor_codes = case["codebook"][case["anchor_ids"]]
+    anchor_codes = row_anchor_codes(case)
     baseline = code_bridge_write(
         case["mlp_out"], case["residual"], anchor_codes, **kwargs
     )
@@ -382,6 +393,53 @@ def test_code_bridge_write_stays_inside_its_block(block_size: int, offset: int):
         for i in range(block_size)
     ]
     assert changed.tolist() == expected
+
+
+def bridge_write_kwargs(case: dict) -> dict:
+    """The keyword half of a `code_bridge_write` call, from a bridge case."""
+    return dict(
+        read_weight=case["read_weight"],
+        packed_weight=torch.cat(
+            (case["gate_weight"], case["predecessor_gate_weight"], case["prev_weight"]),
+            dim=0,
+        ),
+        gate_bias=case["gate_bias"],
+        write_weight=case["write_weight"],
+        norm_weight=case["norm_weight"],
+        block_size=case["block_size"],
+        code_size=case["code_size"],
+        eps=case["eps"],
+        norm_eps=case["norm_eps"],
+    )
+
+
+def test_code_bridge_write_keeps_the_row_dimension_dynamic():
+    """One compiled graph serves every block count the draft runs with.
+
+    vLLM marks the token dimension of the draft model dynamic, and the write runs
+    inside that compiled forward. Geometry that divides the row count solves the
+    symbol into a constant, and on a marked dimension that is an error rather
+    than a recompile: the engine fails to start instead of falling back.
+    """
+    torch._dynamo.reset()
+    counters.clear()
+    written = torch.compile(code_bridge_write, dynamic=True)
+
+    for blocks in (1, 2, 3):
+        case = cast_bridge_case(make_bridge_case(blocks, 8))
+        args = (case["mlp_out"], case["residual"], row_anchor_codes(case))
+        for rows in args:
+            torch._dynamo.mark_dynamic(rows, 0)
+        actual = written(*args, **bridge_write_kwargs(case))
+        expected = code_bridge_write(*args, **bridge_write_kwargs(case))
+        # Inductor reorders the reductions, so this compares at the tolerance the
+        # FP32 reference tests use rather than bit for bit.
+        torch.testing.assert_close(
+            actual.stream, expected.stream, rtol=1e-4, atol=1e-5
+        )
+
+    graphs = counters["stats"]["unique_graphs"]
+    assert graphs == 1, f"the write needed {graphs} graphs for 3 block counts"
 
 
 def ref_refine_table(case: dict, raw, rms, packed, candidates) -> torch.Tensor:
@@ -465,7 +523,7 @@ def last_write(case: dict) -> CodeWrite:
     return code_bridge_write(
         case["mlp_out"],
         case["residual"],
-        case["codebook"][case["anchor_ids"]],
+        row_anchor_codes(case),
         read_weight=case["read_weight"],
         packed_weight=torch.cat(
             (case["gate_weight"], case["predecessor_gate_weight"], case["prev_weight"]),

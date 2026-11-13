@@ -216,7 +216,11 @@ class DSpineCodeBridge(nn.Module):
         layer: int,
         next_norm: nn.Module,
     ) -> CodeWrite:
-        """One code write after `layer`, fused with the next layer's input norm."""
+        """One code write after `layer`, fused with the next layer's input norm.
+
+        `anchor_ids` is [rows]: the anchor token of each row's block, repeated
+        over that block.
+        """
         if not self.ready:
             raise RuntimeError(
                 "The DSpine code bridge was used before its weights were prepared."
@@ -324,7 +328,10 @@ class DSpineQwen3Model(DFlashQwen3Model):
 
         bridge = self.selected_prefix_bridge
         block_size = bridge.block_size
-        anchor_ids = input_ids[::block_size]
+        # The anchor of a row's block, gathered by value so the row count stays
+        # symbolic. A stride slice would tie it to a constant of block_size.
+        row = torch.arange(input_ids.shape[0], device=input_ids.device)
+        anchor_ids = input_ids[row - row % block_size]
         last_layer = len(self.layers) - 1
 
         hidden_states = input_embeds
