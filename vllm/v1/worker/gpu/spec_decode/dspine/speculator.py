@@ -12,6 +12,7 @@ candidate walk then serialises that table into one token per position.
 from typing import Any
 
 import torch
+import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -48,6 +49,12 @@ class DSpineSpeculator(DFlashSpeculator):
         self._cached_candidate_ids = torch.zeros(
             self._walk_scores.shape, dtype=torch.int64, device=device
         )
+
+    def load_model(self, target_model: nn.Module) -> None:
+        super().load_model(target_model)
+        # The draft hands its output matrix to the target's inside the call just
+        # made, so the rows recovered here are the rows the target scores with.
+        self.model.materialize_head_rows()
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # fp32 so the walk and the rejection that checks it read the same

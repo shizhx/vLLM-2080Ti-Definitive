@@ -19,6 +19,7 @@ checkpoint this implementation must refuse rather than mis-serve.
 """
 
 from collections.abc import Iterable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -27,7 +28,9 @@ from torch import nn
 from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
     get_masked_input_and_mask,
 )
@@ -48,19 +51,20 @@ from .utils import WeightsMapper, maybe_prefix
 logger = init_logger(__name__)
 
 
-def gather_vocab_parallel_rows(
-    table: VocabParallelEmbedding, token_ids: torch.Tensor
+def gather_sharded_rows(
+    table: torch.Tensor,
+    shard_indices: Any,
+    tp_size: int,
+    token_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """Rows of a vocab-sharded table, summed over the tensor-parallel shards.
+    """Rows of a vocabulary-sharded table, summed over the tensor-parallel shards.
 
-    ``ParallelLMHead`` refuses the embedding-style forward that would do this,
-    because its weights belong to the sampler, so the sharded lookup an
-    embedding layer performs is repeated here on the table's plain weight.
+    The output matrix refuses the embedding-style forward that would do this,
+    because its weights belong to the sampler, so the lookup an embedding layer
+    performs is repeated here on a plain row table.
     """
-    shard_indices = table.shard_indices
-    weight = table.weight
-    if table.tp_size == 1:
-        return F.embedding(token_ids.long(), weight)
+    if tp_size == 1:
+        return F.embedding(token_ids.long(), table)
 
     masked_ids, unowned = get_masked_input_and_mask(
         token_ids,
@@ -70,9 +74,25 @@ def gather_vocab_parallel_rows(
         shard_indices.added_vocab_start_index,
         shard_indices.added_vocab_end_index,
     )
-    rows = F.embedding(masked_ids.long(), weight)
+    rows = F.embedding(masked_ids.long(), table)
     rows.masked_fill_(unowned.unsqueeze(-1), 0)
     return tensor_model_parallel_all_reduce(rows)
+
+
+def _stores_plain_rows(head: nn.Module, hidden_size: int) -> bool:
+    """Whether a head's weight already holds one plain row per vocabulary entry.
+
+    A quantized head keeps its weights packed for its own gemm instead, and a
+    DFlash draft inherits the target's head, so this has to be asked rather than
+    assumed. Accept both unquantized methods, as `LogitsProcessor._apply_head`
+    does: a quant config that excludes the head hands out the linear method.
+    """
+    if not isinstance(
+        head.quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
+    ):
+        return False
+    weight = head.weight
+    return weight.dim() == 2 and weight.shape[1] == hidden_size
 
 
 class _ReplicatedProjection(nn.Module):
@@ -334,9 +354,89 @@ class DSpineQwen3Model(DFlashQwen3Model):
 class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = DSpineQwen3Model
 
+    # Rows of the identity matrix read through the head per step of
+    # materialize_head_rows, which bounds the logits buffer it builds.
+    HEAD_ROWS_READ_CHUNK = 64
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self.head_topk = self.model.contract.head_topk
+        # One plain row per vocabulary entry of this rank's shard, set by
+        # materialize_head_rows. Either the head's own weight or a copy read
+        # back through it; see that method for when a copy is needed.
+        self._head_rows: torch.Tensor | None = None
+
+    def materialize_head_rows(self) -> None:
+        """Give the refinement the candidate rows of the output matrix.
+
+        The refinement rescores every candidate of every position, which needs
+        the candidates' *rows*, not only their logits; the reference gathers
+        `lm_head_w [V, H]` by row. A DFlash draft does not own its output matrix
+        (the spec-decode loader hands it the target's `lm_head`), and a
+        quantized target keeps that weight packed for its own gemm, where no row
+        lookup here could follow it. So the rows are read back through the head:
+        with the identity matrix as input, the head's output is its own column,
+        and a one-hot input survives any activation quantization exactly. The
+        copy therefore holds the values the target itself scores with.
+
+        Called once by the speculator after the head swap, so it runs before the
+        KV cache is sized and before any cudagraph is captured.
+        """
+        head = self.lm_head
+        hidden_size = self.config.hidden_size
+        if _stores_plain_rows(head, hidden_size):
+            self._head_rows = head.weight
+            logger.info(
+                "DSpine refinement: gathering rows from the unquantized head."
+            )
+            return
+
+        rows: torch.Tensor | None = None
+        # One-hot inputs are what make the read exact, so the head is fed the
+        # identity matrix and its output is handed back as its own columns.
+        eye = torch.eye(
+            hidden_size,
+            dtype=self.model.norm.weight.dtype,
+            device=head.weight.device,
+        )
+        for start in range(0, hidden_size, self.HEAD_ROWS_READ_CHUNK):
+            block = eye[start : start + self.HEAD_ROWS_READ_CHUNK]
+            # The same projection get_top_k_tokens uses, so the rows and the
+            # candidate logits a draft step reports come from one numeric path.
+            logits = self.logits_processor._apply_head(head, block, None)
+            if rows is None:
+                rows = torch.empty(
+                    logits.shape[1],
+                    hidden_size,
+                    dtype=logits.dtype,
+                    device=block.device,
+                )
+            rows[:, start : start + block.shape[0]] = logits.t().to(rows.dtype)
+        del eye
+
+        assert rows is not None
+        self._head_rows = rows
+        logger.info(
+            "DSpine refinement: read %d output-matrix rows (%.2f GiB) back "
+            "through the %s head for the code bridge.",
+            rows.shape[0],
+            rows.numel() * rows.element_size() / 2**30,
+            type(head.quant_method).__name__,
+        )
+
+    def head_rows(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """The rows of the output matrix that `token_ids` select, TP-correct."""
+        if self._head_rows is None:
+            raise RuntimeError(
+                "DSpine refinement needs the output-matrix rows, but "
+                "materialize_head_rows has not run."
+            )
+        return gather_sharded_rows(
+            self._head_rows,
+            self.lm_head.shard_indices,
+            self.lm_head.tp_size,
+            token_ids,
+        )
 
     def compute_candidates(
         self, hidden_states: torch.Tensor
@@ -370,7 +470,7 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             anchor_ids,
             candidate_ids,
             exact_code=bridge.exact_code,
-            head_row=lambda ids: gather_vocab_parallel_rows(self.lm_head, ids),
+            head_row=self.head_rows,
             predecessor_gate_weight=bridge.predecessor_gate.weight,
             prev_weight=bridge.prev.weight,
             gate_bias=bridge.gate.bias,
