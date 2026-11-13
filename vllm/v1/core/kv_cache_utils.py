@@ -1777,8 +1777,8 @@ def get_kv_cache_config_from_groups(
         )
 
     if _uses_native_dflash2(vllm_config):
-        # DFlash2's target and draft cache block tables are independent: the
-        # draft writes its KV at its own absolute slots, so overlaid pages
+        # A native draft's target and draft cache block tables are independent:
+        # the draft writes its KV at its own absolute slots, so overlaid pages
         # would corrupt target KV. Nightly nevertheless requires every
         # KVCacheTensor to describe one backing allocation. Reserve a distinct
         # region for every layer within that allocation while giving every KV
@@ -2413,7 +2413,13 @@ def _largest_divisor_at_most(value: int, limit: int) -> int:
 
 
 def _uses_native_dflash2(vllm_config: VllmConfig) -> bool:
-    """Whether the loaded DFlash draft needs DFlash2's separate KV pools."""
+    """Whether the loaded DFlash draft runs on DFlash2's native KV layout.
+
+    A draft on this layout keeps KV of its own and writes it at its own absolute
+    slots, so its block table is independent of the target's and overlaid pages
+    would corrupt target KV. DFlash2 drafts do, and so do DSpine drafts, which
+    are DFlash drafts with a code bridge on top and the same draft-side KV.
+    """
     speculative_config = vllm_config.speculative_config
     use_dflash = getattr(speculative_config, "use_dflash", None)
     if speculative_config is None or not callable(use_dflash) or not use_dflash():
@@ -2423,13 +2429,15 @@ def _uses_native_dflash2(vllm_config: VllmConfig) -> bool:
     if draft_model_config is None:
         return False
     architectures = getattr(draft_model_config, "architectures", ()) or ()
-    if "DFlash2DraftModel" in architectures:
+    # DFlash2 drafts, and DSpine drafts, which are DFlash drafts with a code
+    # bridge on top and the same draft-side KV.
+    if {"DFlash2DraftModel", "DSpineDraftModel"} & set(architectures):
         return True
     # The architecture can be normalized away when the draft config is loaded
     # through the speculative-model registry. Keep the explicit DFlash2 model
     # identity as a fallback without classifying ordinary DFlash checkpoints.
-    model = str(getattr(draft_model_config, "model", ""))
-    return "dflash2" in model.lower()
+    model = str(getattr(draft_model_config, "model", "")).lower()
+    return "dflash2" in model or "dspine" in model
 
 
 def _get_dflash_draft_layer_names(
