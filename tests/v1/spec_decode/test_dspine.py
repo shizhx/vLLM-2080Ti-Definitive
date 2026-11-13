@@ -14,11 +14,17 @@ c66bf44) for the upstream originals of `ref_eager_bridge_write` and
 import math
 from types import SimpleNamespace
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 from transformers import Qwen3Config
 
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+)
 from vllm.model_executor.models.dspine_bridge import (
     CodeWrite,
     code_bridge_write,
@@ -29,6 +35,10 @@ from vllm.model_executor.models.dspine_contract import (
     is_dspine_draft,
     resolve_dspine_contract,
     validate_served_block_size,
+)
+from vllm.model_executor.models.qwen3_dspine import (
+    _stores_plain_rows,
+    read_rows_through_head,
 )
 
 MIN_MEAN_SQUARE = torch.finfo(torch.float32).tiny
@@ -793,3 +803,65 @@ def test_dspine_serves_a_smaller_block_than_trained_but_never_a_larger_one():
         validate_served_block_size(contract, 32)
     with pytest.raises(ValueError, match="2..16"):
         validate_served_block_size(contract, 1)
+
+
+# --- Output-matrix rows for the refinement -----------------------------------
+
+
+def test_head_rows_read_back_the_matrix_they_came_from():
+    """Reading an output matrix with the identity recovers its rows.
+
+    The chunk width deliberately does not divide the hidden size, so the last
+    partial read is checked too.
+    """
+    matrix = torch.randn(37, 12)
+
+    rows = read_rows_through_head(
+        lambda block: block @ matrix.t(),
+        hidden_size=12,
+        dtype=matrix.dtype,
+        device=matrix.device,
+        chunk_rows=5,
+    )
+
+    torch.testing.assert_close(rows, matrix, rtol=1e-5, atol=1e-6)
+
+
+def test_head_rows_read_back_survive_a_repacked_head():
+    """The read reaches a matrix a gather could not: it goes through the head.
+
+    A quantized target stores its output matrix packed for its own gemm, and a
+    DFlash draft inherits that matrix, so the rows are not reachable as a tensor
+    the host could index. Reading through a head that keeps its weights
+    column-major shows the recovery does not care how they are stored.
+    """
+    matrix = torch.randn(37, 12)
+    packed = matrix.t().contiguous()
+
+    rows = read_rows_through_head(
+        lambda block: block @ packed,
+        hidden_size=12,
+        dtype=matrix.dtype,
+        device=matrix.device,
+        chunk_rows=12,
+    )
+
+    torch.testing.assert_close(rows, matrix, rtol=1e-5, atol=1e-6)
+
+
+def _head_like(quant_method, weight) -> SimpleNamespace:
+    return SimpleNamespace(quant_method=quant_method, weight=weight)
+
+
+def test_plain_row_table_is_recognized_only_for_a_plain_row_table():
+    """A head needs no copy exactly when its weight is rows of features."""
+    hidden = 12
+    plain = _head_like(UnquantizedEmbeddingMethod(), torch.zeros(37, hidden))
+    transposed = _head_like(UnquantizedEmbeddingMethod(), torch.zeros(hidden, 37))
+    linear = _head_like(UnquantizedLinearMethod(), torch.zeros(37, hidden))
+    packed = _head_like(object(), torch.zeros(hidden // 16, 37, dtype=torch.int32))
+
+    assert _stores_plain_rows(plain, hidden)
+    assert _stores_plain_rows(linear, hidden)
+    assert not _stores_plain_rows(transposed, hidden)
+    assert not _stores_plain_rows(packed, hidden)

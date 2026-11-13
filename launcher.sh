@@ -357,7 +357,7 @@ normalize_speculative_method_value() {
     "") ;;
     none|off|disabled) echo none ;;
     mtp) echo mtp ;;
-    dflash|dflash2) echo dflash ;;
+    dflash|dflash2|dspine) echo dflash ;;
     *)
       printf '%s\n' "${1,,}"
       ;;
@@ -368,7 +368,7 @@ infer_speculative_method_from_model_ref() {
   local ref=${1:-}
   ref=${ref,,}
   case "$ref" in
-    *dflash*)
+    *dspine*|*dflash*)
       printf 'dflash\n'
       ;;
   esac
@@ -766,7 +766,9 @@ current_speculative_label() {
     draft_ref=$(effective_speculative_model)
     draft_ref=${draft_ref:-draft-not-set}
     draft_ref=${draft_ref##*/}
-    if [[ "${draft_ref,,}" == *dflash2* ]]; then
+    if [[ "${draft_ref,,}" == *dspine* ]]; then
+      printf 'dspine/%s (%s%s)\n' "$tokens" "$draft_ref" "$suffix"
+    elif [[ "${draft_ref,,}" == *dflash2* ]]; then
       printf 'dflash2/%s (%s%s)\n' "$tokens" "$draft_ref" "$suffix"
     else
       printf 'dflash/%s (%s%s)\n' "$tokens" "$draft_ref" "$suffix"
@@ -811,7 +813,9 @@ profile_speculative_label() {
   fi
 
   if [[ "$method" == "dflash" && -n "$spec_model" ]]; then
-    if [[ "${spec_model,,}" == *dflash2* ]]; then
+    if [[ "${spec_model,,}" == *dspine* ]]; then
+      printf 'dspine:%s\n' "$tokens"
+    elif [[ "${spec_model,,}" == *dflash2* ]]; then
       printf 'dflash2:%s\n' "$tokens"
     else
       printf 'dflash:%s\n' "$tokens"
@@ -3647,7 +3651,7 @@ edit_speculative_decode_menu() {
   local draft_model draft_tp draft_max_model_len attention_backend kv_cache_dtype disable_padded use_local_argmax draft_sample_method
 
   current=$(current_speculative_label)
-  method_choice=$(menu_select "Spec decode" "$current" disabled mtp dflash dflash2 raw-json) || return 0
+  method_choice=$(menu_select "Spec decode" "$current" disabled mtp dflash dflash2 dspine raw-json) || return 0
 
   case "$method_choice" in
     disabled)
@@ -3661,18 +3665,24 @@ edit_speculative_decode_menu() {
       tokens=$(prompt_default "MTP speculative tokens" "$default_tokens") || return 0
       configure_mtp_shortcut "$tokens"
       ;;
-    dflash|dflash2)
+    dflash|dflash2|dspine)
+      local draft_label=DFlash
+      if [[ "$method_choice" == "dflash2" ]]; then
+        draft_label=DFlash2
+      elif [[ "$method_choice" == "dspine" ]]; then
+        draft_label=DSpine
+      fi
       default_tokens=$(effective_speculative_tokens)
       if [[ "$default_tokens" == "0" ]]; then
         default_tokens=${SPECULATIVE_TOKENS:-7}
       fi
-      draft_model=$(select_model_path draft "DFlash2 draft model path or repo" "$(effective_speculative_model)" 2) || return 0
-      tokens=$(prompt_default "DFlash speculative tokens" "$default_tokens") || return 0
-      draft_tp=$(prompt_optional "DFlash draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
-      draft_max_model_len=$(prompt_optional "DFlash draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
-      attention_backend=$(prompt_optional "DFlash draft attention backend" "${SPECULATIVE_ATTENTION_BACKEND:-}") || return 0
-      kv_cache_dtype=$(prompt_default "DFlash draft KV cache dtype" "${SPECULATIVE_KV_CACHE_DTYPE:-float16}") || return 0
-      draft_sample_method=$(menu_select "DFlash draft sample method" "$(effective_speculative_draft_sample_method)" greedy probabilistic) || return 0
+      draft_model=$(select_model_path draft "$draft_label draft model path or repo" "$(effective_speculative_model)" 2) || return 0
+      tokens=$(prompt_default "$draft_label speculative tokens" "$default_tokens") || return 0
+      draft_tp=$(prompt_optional "$draft_label draft TP size" "${SPECULATIVE_DRAFT_TP_SIZE:-}") || return 0
+      draft_max_model_len=$(prompt_optional "$draft_label draft max_model_len" "${SPECULATIVE_MAX_MODEL_LEN:-}") || return 0
+      attention_backend=$(prompt_optional "$draft_label draft attention backend" "${SPECULATIVE_ATTENTION_BACKEND:-}") || return 0
+      kv_cache_dtype=$(prompt_default "$draft_label draft KV cache dtype" "${SPECULATIVE_KV_CACHE_DTYPE:-float16}") || return 0
+      draft_sample_method=$(menu_select "$draft_label draft sample method" "$(effective_speculative_draft_sample_method)" greedy probabilistic) || return 0
       disable_padded=$(prompt_toggle01 "Disable padded drafter batch" "${SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH:-0}") || return 0
       use_local_argmax=$(prompt_toggle01 "Use local argmax reduction" "${SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION:-0}") || return 0
       configure_dflash_shortcut \
@@ -4648,7 +4658,7 @@ validate_speculative_route() {
   if [[ -z "$method" ]]; then
     if [[ -n "${SPECULATIVE_TOKENS:-}" || -n "${SPECULATIVE_DRAFT_TP_SIZE:-}" || -n "${SPECULATIVE_MAX_MODEL_LEN:-}" || -n "${SPECULATIVE_ATTENTION_BACKEND:-}" || -n "${SPECULATIVE_KV_CACHE_DTYPE:-}" || -n "${SPECULATIVE_DRAFT_SAMPLE_METHOD:-}" ]] || config_key_has_explicit_value SPECULATIVE_DISABLE_PADDED_DRAFTER_BATCH || config_key_has_explicit_value SPECULATIVE_USE_LOCAL_ARGMAX_REDUCTION; then
       echo "ERROR: speculative fields were set but SPECULATIVE_METHOD is missing." >&2
-      echo "       Use SPECULATIVE_METHOD=mtp|dflash or provide SPECULATIVE_CONFIG." >&2
+      echo "       Use SPECULATIVE_METHOD=mtp|dflash|dflash2|dspine or provide SPECULATIVE_CONFIG." >&2
       return 1
     fi
     return 0

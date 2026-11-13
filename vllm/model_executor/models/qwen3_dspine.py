@@ -19,7 +19,7 @@ checkpoint this implementation must refuse rather than mis-serve.
 """
 
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -351,6 +351,40 @@ class DSpineQwen3Model(DFlashQwen3Model):
         return hidden_states, write.raw, write.rms, write.packed
 
 
+def read_rows_through_head(
+    apply_head: Callable[[torch.Tensor], torch.Tensor],
+    hidden_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Every row of an output matrix, read back through the matrix itself.
+
+    `apply_head` projects [rows, hidden] features to [rows, vocabulary]. Feeding
+    it the identity matrix makes each output row one column of the matrix, so
+    transposing the logits gives the row table. One-hot inputs are exact under
+    any activation quantization, which is what makes the read faithful for a
+    matrix stored in a layout no host here could gather from.
+
+    Reads `chunk_rows` columns at a time, which bounds the logits buffer.
+    """
+    rows: torch.Tensor | None = None
+    for start in range(0, hidden_size, chunk_rows):
+        width = min(chunk_rows, hidden_size - start)
+        block = torch.zeros(width, hidden_size, dtype=dtype, device=device)
+        columns = torch.arange(start, start + width, device=device)
+        block[torch.arange(width, device=device), columns] = 1
+        logits = apply_head(block)
+        if rows is None:
+            rows = torch.empty(
+                logits.shape[1], hidden_size, dtype=logits.dtype, device=device
+            )
+        rows[:, start : start + width] = logits.t().to(rows.dtype)
+
+    assert rows is not None, "the output matrix has no vocabulary to read"
+    return rows
+
+
 class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = DSpineQwen3Model
 
@@ -391,30 +425,15 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
             return
 
-        rows: torch.Tensor | None = None
-        # One-hot inputs are what make the read exact, so the head is fed the
-        # identity matrix and its output is handed back as its own columns.
-        eye = torch.eye(
+        # The same projection get_top_k_tokens uses, so the rows and the
+        # candidate logits a draft step reports come from one numeric path.
+        rows = read_rows_through_head(
+            lambda block: self.logits_processor._apply_head(head, block, None),
             hidden_size,
-            dtype=self.model.norm.weight.dtype,
-            device=head.weight.device,
+            self.model.norm.weight.dtype,
+            head.weight.device,
+            self.HEAD_ROWS_READ_CHUNK,
         )
-        for start in range(0, hidden_size, self.HEAD_ROWS_READ_CHUNK):
-            block = eye[start : start + self.HEAD_ROWS_READ_CHUNK]
-            # The same projection get_top_k_tokens uses, so the rows and the
-            # candidate logits a draft step reports come from one numeric path.
-            logits = self.logits_processor._apply_head(head, block, None)
-            if rows is None:
-                rows = torch.empty(
-                    logits.shape[1],
-                    hidden_size,
-                    dtype=logits.dtype,
-                    device=block.device,
-                )
-            rows[:, start : start + block.shape[0]] = logits.t().to(rows.dtype)
-        del eye
-
-        assert rows is not None
         self._head_rows = rows
         logger.info(
             "DSpine refinement: read %d output-matrix rows (%.2f GiB) back "
