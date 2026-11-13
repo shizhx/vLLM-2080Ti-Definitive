@@ -24,6 +24,29 @@
 | `qwen27b/w4a16/mtp4-fp16kv-1x262K-text-image.env` | 262K | FP16 | MTP/4 | text+image | 436,388 | 1526.32 / 125.70 | 1517.31 / 123.13 |
 | `qwen27b/w4a16/mtp4-fp8kv-2x262K-text-image.env` | 2 x 262K | FP8 | MTP/4 | text+image | 823,249 | 1507.94 / 116.86 | 1477.49 / 118.77 |
 
+
+### DSpine 与对照的 DFlash2,2026-11-13 实测
+
+测试权重:[unsloth/Qwen3.8-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.8-27B-NVFP4);DSpine draft:`Qwen3.8-27B-DSpine-b16`(Tencent DSpine,本机权重);DFlash2 draft:[incoai/Qwen3.8-27B-DFlash2](https://huggingface.co/incoai/Qwen3.8-27B-DFlash2)
+
+| Profile | 上下文 | KV | 投机解码 | 消息 | GPU KV tokens | 4K/128 prefill / decode | 32K/512 prefill / decode |
+|---|---:|---|---|---|---:|---:|---:|
+| `qwen27b/w4a16/dspine-fp16kv-1x262K-text-only.env` | 262K | FP16 | DSpine/7 | text-only | 395,704 | 1629.78 / 206.72 | 1532.39 / 183.01 |
+| `qwen27b/w4a16/dspine-fp8kv-2x262K-text-only.env` | 2 x 262K | FP8 | DSpine/7 | text-only | 704,512 | 1389.00 / 209.81 | 1277.10 / 182.55 |
+| `qwen27b/w4a16/dspine-tqk8v4-4x220K-text-only.env` | 4 x 220K | TQK8V4 | DSpine/7 | text-only | 780,000 | 1424.12 / 203.61 | 1207.92 / 127.32 |
+| `qwen27b/w4a16/dflash2-fp16kv-1x262K-text-only.env` | 262K | FP16 | DFlash2/7 | text-only | 423,080 | 1628.09 / 223.45 | 1539.66 / 222.57 |
+| `qwen27b/w4a16/dflash2-fp8kv-2x262K-text-only.env` | 2 x 262K | FP8 | DFlash2/7 | text-only | 755,302 | 1388.23 / 227.23 | 1302.87 / 222.69 |
+| `qwen27b/w4a16/dflash2-tqk8v4-4x220K-text-only.env` | 4 x 220K | TQK8V4 | DFlash2/7 | text-only | 851,960 | 1428.97 / 220.34 | 1232.28 / 145.68 |
+
+这些行来自该日期的开发机(六张卡:PCI 索引 0-3 的四张 Tesla T10,另有两张 RTX 2080
+Ti;251 GiB 内存),不是说明 3 中的那台机器,因此不能与上面的表格直接比较。每一行
+DSpine 只能与同一会话中测出的对应 DFlash2 行比较:同一条 DFlash2 fp16kv 路由在这里
+是 423,080 GPU KV tokens,在说明 3 的机器上是 432,205。在这组对照中,DSpine 的 KV 少
+6.5-8.4%,因为最后一次 write 的精修需要在每张卡上保留一份输出矩阵;prefill 与
+DFlash2 相差不到千分之三;decode 在 4K/128 下低 7.5-7.7%,在 32K/512 下低
+12.6-18.0%。DSpine 路由是作为"已实测"发布,而不是作为更快的方案发布:支撑这些路由的
+检查,以及尚未定位的开销,记录在 `docs/design/dspine-vllm-port.md` 第 13、14 节。
+
 ## 说明
 
 1. Profile 直接放在各模型/权重目录下，不再按 mode 分目录。Mode 由 launcher 选择，默认使用 `fast`。

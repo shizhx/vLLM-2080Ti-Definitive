@@ -346,6 +346,74 @@ published greedy numbers and record the choice in the code.
 by one, acceptance would collapse to about 1.0 with no error. The first end-to-end
 run must therefore print acceptance length before anything else.
 
+### 7.9 The compiled draft forward cannot divide its own row count
+
+vLLM compiles the draft model with its token dimension marked dynamic, so one
+graph serves the prefill-draft pass and every block-draft batch. Solving a marked
+dimension into a constant is a hard failure there, not a recompile:
+
+```
+ConstraintViolationError: Constraints violated (L['input_ids'].size()[0],
+  L['positions'].size()[0])!
+  - You marked L['input_ids'].size()[0] as dynamic but your code specialized it
+    to be a constant (8).
+```
+
+The first draft of `code_bridge_write` found each block's anchor row the way the
+upstream kernel does: `num_rows % block_size` to validate, `num_rows // block_size`
+to reshape into blocks, and `input_ids[::block_size]` for the anchor tokens. With
+a block size of 8 and one request, that pins the token dimension to 8 and the
+route never starts. The write now finds the same rows with elementwise arithmetic
+on a row index (`dspine_bridge.py:77`), which keeps the row count symbolic and
+changes no number: the FP64 reference and the upstream eager path still match bit
+for bit. Geometry that *may* divide the rows belongs to the eager caller
+(`refine_last_write`, `dspine_bridge.py:152`), where the shape is already known.
+
+`test_code_bridge_write_keeps_the_row_dimension_dynamic`
+(`tests/v1/spec_decode/test_dspine.py:416`) holds the line: it compiles the write
+once, feeds it one, two, and three blocks, and requires one graph rather than two.
+Shape arithmetic shows up there as a second graph, which is what the engine pays
+for as a failed start.
+
+### 7.10 A quantized target head has no rows to gather
+
+The refinement scores candidates with rows of the draft's output matrix, and the
+draft shares that matrix with the target. Gathering `lm_head.weight` rows assumes
+the head stores rows plainly. On the NVFP4 target it does not: the head is stored
+as packed INT4 with a per-output-channel scale
+(`weight (320, 248320) int32` on a TP4 rank, `CompressedTensorsLinearMethod`), so
+a row gather reads packed blocks and fails on the device.
+
+The rows are instead read back *through* the head (`read_rows_through_head`,
+`qwen3_dspine.py:361`): feeding the head one-hot inputs makes it emit its own
+columns, and transposing the logits gives the row table. One-hot inputs are exact
+under any activation quantization, and the numbers come from the same
+`LogitsProcessor._apply_head` call the draft's own top-k uses, so the refinement
+scores with the head the target actually has. It costs 0.59 GiB per rank here
+(62,080 rows in FP16), read once at load (`materialize_head_rows`,
+`qwen3_dspine.py:410`). A head that does store plain rows skips all of this.
+
+### 7.11 A draft with KV of its own needs DFlash2's native KV layout
+
+DSpine drafts keep attention KV like DFlash2 drafts do. Under the shared DFlash
+layout that KV is overlaid with the target's pages, and a long route gives the
+manager a block larger than the Triton draft kernel's 64-token block, so kernel
+blocks have to subdivide a manager block. Subdivision needs dense, unpadded pages
+(`kv_cache_interface.py:368-380`), and an overlaid page is not dense:
+
+```
+ValueError: The resolved KV cache layout (BLHNC) does not store blocks as dense,
+unpadded pages (block stride 13631488 != page 851968), so a manager block cannot
+be split into 13 kernel blocks of 64 tokens.
+```
+
+Forcing `--disable-hybrid-kv-cache-manager` instead fails elsewhere ("Failed to
+promote local KV cache specs to one unified type"). The fix is the one DFlash2
+already uses: `_uses_native_dflash2` (`kv_cache_utils.py:2415`) also recognises
+`DSpineDraftModel`, which gives every KV group its own block-ID pool. Short
+context hides this: at 4 K tokens the manager block equals the kernel block, so
+the first bring-up runs passed without it.
+
 ## 8. Design
 
 ### 8.1 Method identity
@@ -529,15 +597,20 @@ larger `MAX_NUM_SEQS`, and 2x2080Ti capacity sizing.
 nvidia-smi --query-gpu=index,name,compute_cap --format=csv      # 0-3 Tesla T10 sm75, 4-5 RTX 2080 Ti sm75
 .venv/bin/python -c "import vllm; print(vllm.__file__)"         # editable install in this working tree
 
-# Planned smoke launch (T10 only, 2080 Ti untouched). NVFP4 target per decision 4.
-# The dspine profiles do not exist yet; until Phase 5 adds them, copy
-# 4xT10/qwen27b/w4a16/dflash2-fp16kv-1x262K-text-only.env and set
-# SPECULATIVE_TOKENS (7 for Phase 2, 15 for Phase 4).
-CUDA_DEVICE_ORDER=PCI_BUS_ID ./launcher.sh \
-  --model-dir /home/hsz/Models/Qwen3.8-27B-NVFP4 \
-  --speculative-model /home/hsz/Workspace/vLLM-DSpine/Qwen3.8-27B-DSpine-b16 \
-  --profile 4xT10/qwen27b/w4a16/dspine16-fp16kv-1x262K-text-only.env \
-  --gpu-devices 0,1,2,3 --tp-size 4 --pp-size 1 --print-config
+# Route review (T10 only, 2080 Ti untouched). NVFP4 target per decision 4.
+# The route comes from the profile; the drafter is not a profile field, so the
+# draft is named here. CUDA_DEVICE_ORDER keeps the T10s at indices 0-3: without
+# it this host numbers a 2080 Ti first.
+CUDA_DEVICE_ORDER=PCI_BUS_ID PROFILE_FILE=profiles/4xT10/qwen27b/w4a16/dspine-fp16kv-1x262K-text-only.env \
+  MODEL_DIR=/home/hsz/Models/Qwen3.8-27B-NVFP4 \
+  SPECULATIVE_MODEL=/home/hsz/Workspace/vLLM-DSpine/Qwen3.8-27B-DSpine-b16 \
+  GPU_DEVICES=0,1,2,3 TP_SIZE=4 PP_SIZE=1 MODE=fast \
+  ./launcher.sh --print-config
+
+# Starting it non-interactively also needs the host commit headroom to cover the
+# largest checkpoint file (21 GiB here), which is what vm.overcommit_memory=1
+# gives. The launcher's mmap preflight refuses to start without it, and raising it
+# needs root.
 
 # Before publishing any change (AGENTS.md)
 bash -n build.sh launcher.sh tools/validate_profiles.sh
@@ -609,3 +682,104 @@ Good news found after the decisions: the launcher already emits
 (`launcher.sh:467-480, 5033-5038`), which satisfies the SM75 gate's capture-size
 condition for any `K` and any `MAX_NUM_SEQS`. Only the hard width limit at
 `flashinfer.py:121` blocks `K=15`, and it blocks every concurrency level equally.
+
+## 13. What the first runs found
+
+### 13.1 Greedy output matches the shipped drafter, not the no-speculative baseline
+
+Five prompts, 128 greedy tokens each, TP4 over four T10 GPUs, eager mode, NVFP4
+target with a `K = 7` draft:
+
+| Comparison | Result |
+|---|---|
+| DSpine `K = 7` vs DFlash2 `K = 7` | identical token ids on all five prompts |
+| DSpine `K = 7` vs no speculative decoding | differs on three prompts, at tokens 105, 40, 55 |
+| DFlash2 `K = 7` vs no speculative decoding | differs on the same three prompts, at the same tokens, with the same tokens |
+
+The divergences are near ties, not garbled text: `this premise` against
+`that premise`, `for the function` against `as the primary function`. Verifying a
+block of eight positions changes the target's own numerics, and on a quantized
+head a near tie can flip. Every DFlash-family drafter on this route inherits that,
+so "greedy output equals the no-speculative baseline" is not a claim this port can
+make, and the shipped DFlash2 route does not make it either. What the port can
+claim, and measured, is that DSpine behaves exactly like the drafter already
+published.
+
+### 13.2 Acceptance on that sample
+
+Same five prompts, greedy, acceptance length as reported by the engine:
+
+| Draft | Acceptance length |
+|---|---:|
+| DSpine `K = 7` | 3.868 |
+| DSpine `K = 3` | 2.981 |
+| DFlash2 `K = 7` (control) | 4.365 |
+
+Five prompts of 128 tokens is a bring-up sample, not a benchmark. It says the
+bridge works and that DFlash2's selector drafter accepts more on this sample; it
+does not rank the two drafters. The GSM8K acceptance test in §10 Phase 6 is what
+would settle that, and it is not run yet.
+
+### 13.3 Costs found at run time
+
+- The head row read-back (§7.10) reads 62,080 rows per rank and holds 0.59 GiB of
+  FP16 per rank for the life of the process. It happens once, at draft load.
+- That reservation is visible in capacity: the `w4a16/dspine-fp16kv-1x262K` route
+  gets 395,704 GPU KV tokens where the DFlash2 twin gets 423,080 (§14).
+- The refinement adds one all-reduce per draft step for the exact sender codes on
+  top of the candidate gather DFlash2 already does.
+
+### 13.4 Checks that run in the suite
+
+`tests/v1/spec_decode/test_dspine.py` holds 41 checks: the bridge against a float64
+reference and against a port of the upstream eager path (bit-exact in FP32 and
+BF16, block sizes 2/8/16), block-locality of a write, the refinement table against
+a float64 loop, the candidate walk against a hand-built chain, the checkpoint
+contract including each shape it refuses, the head row read-back through a
+repacked head, and the shape-dynamism guard of §7.9. One check skips: served block
+8 has no offset 15, so the trained-block locality case cannot run on it.
+`tests/v1/spec_decode/test_dflash2.py` and the three DFlash behaviour suites (46
+checks) cover the shared walk and cache utilities this port lifted out of DFlash2.
+
+## 14. Measured routes
+
+Launcher `fast` mode, TP4 over four T10 GPUs (PCI indices 0-3), one request at a
+time, the reference lane of `profiles/4xT10/README.md`: warm-up excluded, 4K/128 as
+the median of three requests, 32K/512 run to completion, Prefix Cache off during
+the test. Each DFlash2 row is the same profile file with the DFlash2 draft, run on
+this host in this session, so rows pair with the one under them.
+
+They do not pair with the numbers published in `profiles/4xT10/README.md`, which
+were taken on another host: the DFlash2 fp16kv route reads 423,080 GPU KV tokens
+here against 432,205 there.
+
+| Route | GPU KV tokens | 4K/128 prefill / decode | 32K/512 prefill / decode |
+|---|---:|---:|---:|
+| `w4a16/dspine-fp16kv-1x262K-text-only` | 395,704 | 1629.78 / 206.72 | 1532.39 / 183.01 |
+| `w4a16/dflash2-fp16kv-1x262K-text-only` | 423,080 | 1628.09 / 223.45 | 1539.66 / 222.57 |
+| `w4a16/dspine-fp8kv-2x262K-text-only` | 704,512 | 1389.00 / 209.81 | 1277.10 / 182.55 |
+| `w4a16/dflash2-fp8kv-2x262K-text-only` | 755,302 | 1388.23 / 227.23 | 1302.87 / 222.69 |
+| `w4a16/dspine-tqk8v4-4x220K-text-only` | 780,000 | 1424.12 / 203.61 | 1207.92 / 127.32 |
+| `w4a16/dflash2-tqk8v4-4x220K-text-only` | 851,960 | 1428.97 / 220.34 | 1232.28 / 145.68 |
+
+What the three pairs say:
+
+- **Prefill is a wash**, within a third of a percent in every pair. Speculative
+  decoding does not touch prefill, and the draft is not in the prefill path.
+- **DSpine holds 6.5-8.4% less KV** than its twin. The refinement's head-row copy
+  (§7.10) reserves 0.59 GiB per rank, which is most of the difference; the
+  candidate and walk buffers account for the rest.
+- **DSpine decodes 7.5-7.7% slower at 4K/128 and 12.6-18.0% slower at 32K/512.**
+  Two costs sit there, and neither has been attributed yet: the work the refinement
+  adds per draft step (a head-row gather, an all-reduce for the exact sender codes,
+  a `[rows, 16, 16]` einsum), and the acceptance difference of §13.2, where the
+  DFlash2 drafter accepted more on the sample. The gap widening with context
+  suggests per-step overhead rather than acceptance, since acceptance length should
+  not depend much on context. That is a hypothesis, not a measurement.
+- **The gain published in §4 is not reproduced on this hardware.** Those figures
+  come from SGLang on different GPUs and with a different block size. Saying more
+  about the difference would need a benchmark this port has not run.
+
+Not measured: the W8A16 profiles (the Qwen3.8-27B-FP8 target is not on this host),
+probabilistic draft sampling, and `K = 15`, which §7.4 keeps behind the SM75 graph
+gate.
